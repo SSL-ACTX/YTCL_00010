@@ -4,9 +4,7 @@
 ##    Written By: SSL-ACTX   For educational purposes only!   ##
 ###############################################################$
 import asyncio
-import aiohttp
 import json
-import time
 import re
 import argparse
 import configparser
@@ -17,14 +15,15 @@ from rich.theme import Theme
 from rich.panel import Panel
 from rich.text import Text
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
-from rich.filesize import decimal
+import httpx  # Now using httpx --> for faster async requests
 from youtubesearchpython import Search
 
-# Constants and Configuration
-POLLING_INTERVAL = 2
+
+# Cfg Constants
+POLLING_INTERVAL = 2  # How often to check download progress (seconds)
 CONFIG_FILE = 'config.ini'
 DOWNLOAD_DIR = "downloads"
-HEADERS = {
+HEADERS = {  # Standard headers for requests
     'accept': '*/*',
     'accept-language': 'en-US,en;q=0.9',
     'dnt': '1',
@@ -39,10 +38,11 @@ HEADERS = {
     'sec-fetch-site': 'cross-site',
     'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 }
-FORMAT_OPTIONS = ["mp3", "1080", "720", "480", "360", "240"]
+FORMAT_OPTIONS = ["mp3", "1080", "720", "480",
+                  "360", "240"]  # Supported download formats
 
 
-# Rich setup
+# Rich Console Setup for stylized output
 custom_theme = Theme({
     "info": "bold cyan", "warning": "bold yellow", "error": "bold red",
     "success": "bold green", "url": "underline blue", "progress": "magenta", "status": "white"
@@ -51,40 +51,55 @@ console = Console(theme=custom_theme)
 
 
 def clear_terminal():
+    """Clears the terminal screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def load_config() -> configparser.ConfigParser:
+    """Loads configuration from config.ini, creating it if it doesn't exist."""
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE)
     if 'settings' not in config:
-        config['settings'] = {'auto_download': 'false', 'auto_clear': 'false'}
+        config['settings'] = {'auto_download': 'false',
+                              'auto_clear': 'false'}  # Default settings
     return config
 
 
 def save_config(config: configparser.ConfigParser):
+    """Saves the configuration to config.ini."""
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
 
 async def _api_request(url: str, params: dict, method: str = "GET", retries: int = 3) -> Optional[dict]:
-    """Handles API requests with retry logic and error handling using aiohttp."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.request(method, url, headers=HEADERS, params=params) as response:
-                response.raise_for_status()
-                return await response.json()
-    except aiohttp.ClientError as e:
-        console.print(f"Error during request: {e}", style="error")
-        if retries > 0:
-            await asyncio.sleep(1)
-            console.print(f"Retrying... (retries left: {
-                          retries})", style="warning")
-            return await _api_request(url, params, method, retries - 1)
-        console.print("Request failed after multiple retries.", style="error")
-    except json.JSONDecodeError as e:
-        console.print(f"Error decoding JSON response: {e}", style="error")
-    return None
+    """Handles API requests with retry logic and error handling using httpx."""
+    async with httpx.AsyncClient(headers=HEADERS) as client:
+        try:
+            # Add timeout (imp!)
+            response = await client.request(method, url, params=params, timeout=10.0)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx) :)
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            console.print(f"HTTP Error: {e}", style="error")
+            if retries > 0:
+                await asyncio.sleep(1)
+                console.print(f"Retrying... (retries left: {
+                              retries})", style="warning")
+                return await _api_request(url, params, method, retries - 1)
+            console.print(
+                "Request failed after multiple retries.", style="error")
+        except httpx.RequestError as e:
+            console.print(f"Request Error: {e}", style="error")
+            if retries > 0:
+                await asyncio.sleep(1)
+                console.print(f"Retrying... (retries left: {
+                              retries})", style="warning")
+                return await _api_request(url, params, method, retries - 1)
+            console.print(
+                "Request failed after multiple retries.", style="error")
+        except json.JSONDecodeError as e:
+            console.print(f"Error decoding JSON response: {e}", style="error")
+        return None
 
 
 async def get_download_link(youtube_url: str, format: str = "mp3") -> Optional[str]:
@@ -117,6 +132,7 @@ async def process_download_progress(video_id: str) -> Optional[str]:
         while True:
             data = await _api_request(progress_url, params)
             if not data:
+                await asyncio.sleep(POLLING_INTERVAL)  # Prevent busy-loop
                 continue
             if data.get("success") == 1 and (download_url := data.get("download_url")):
                 progress.update(task_id, completed=1000)
@@ -137,29 +153,29 @@ async def process_download_progress(video_id: str) -> Optional[str]:
 
 
 def sanitize_filename(title: str) -> str:
-    """Sanitizes the title for use as a filename."""
+    """Sanitizes the title for use as a filename, replacing spaces and removing invalid characters."""
     return re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', title)).strip()
 
 
 async def download_file(url: str, youtube_url: str, format: str):
-    """Downloads a file from the given URL to the correct subfolder using aiohttp."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(youtube_url) as response:
-                response.raise_for_status()
-                text = await response.text()
-            title_match = re.search(r'<title>(.*?)</title>', text)
+    """Downloads a file from the given URL to the correct subfolder using httpx."""
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
+        try:
+            response = await client.get(youtube_url)
+            response.raise_for_status()
+            title_match = re.search(r'<title>(.*?)</title>', response.text)
+            # Extract title from HTML
             title = title_match.group(1).strip() if title_match else "download"
             sanitized_title = sanitize_filename(title)
             extension = ".mp3" if format == "mp3" else ".mp4"
             filename = f"{sanitized_title}{extension}"
             download_path = os.path.join(
                 DOWNLOAD_DIR, "Music" if format == "mp3" else "Videos")
+            # Ensure directory exists
             os.makedirs(download_path, exist_ok=True)
             file_path = os.path.join(download_path, filename)
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+            async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get('content-length', 0))
                 with Progress(
@@ -176,16 +192,24 @@ async def download_file(url: str, youtube_url: str, format: str):
                 ) as progress:
                     task_id = progress.add_task(
                         "Downloading", total=total_size)
+                    downloaded = 0
                     with open(file_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
+                        async for chunk in response.aiter_bytes():
                             f.write(chunk)
+                            downloaded += len(chunk)
                             progress.update(task_id, advance=len(chunk))
 
-        console.print(Panel(Text(f"Downloaded '{filename}' successfully to '{
-                      download_path}'.", style="success")), style="success")
+            console.print(Panel(Text(f"Downloaded '{filename}' successfully to '{
+                          download_path}'.", style="success")), style="success")
 
-    except aiohttp.ClientError as e:
-        console.print(f"Error during download: {e}", style="error")
+        except httpx.HTTPStatusError as e:
+            console.print(
+                f"Error during download: HTTP Error - {e}", style="error")
+        except httpx.RequestError as e:
+            console.print(
+                f"Error during download: Request Error - {e}", style="error")
+        except Exception as e:
+            console.print(f"An unexpected error occurred: {e}", style="error")
 
 
 async def search_youtube_video(query: str) -> Optional[str]:
@@ -208,6 +232,7 @@ async def search_youtube_video(query: str) -> Optional[str]:
 
 
 def main():
+    """Main function to handle user input, search, and download."""
     parser = argparse.ArgumentParser(
         description="YouTube downloader with auto-download and clear options.")
     parser.add_argument("--auto-dl", type=str,
@@ -246,7 +271,7 @@ def main():
 
     if format_choice not in FORMAT_OPTIONS:
         console.print(f"Invalid format. Choose one of: {
-            ', '.join(FORMAT_OPTIONS)}.", style="error")
+                      ', '.join(FORMAT_OPTIONS)}.", style="error")
         return
 
     download_link = asyncio.run(get_download_link(
